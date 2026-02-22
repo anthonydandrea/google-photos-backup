@@ -1,0 +1,24 @@
+# Credentials and tokens — never commit these
+credentials.json
+token.json
+.env
+.claude
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Rust
+target/
+
+# CDK
+infra/cdk.out/
+infra/node_modules/
+
+# macOS
+.DS_Store

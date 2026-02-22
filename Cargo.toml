@@ -1,0 +1,26 @@
+[package]
+name = "google-photos-backup"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "backup"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-credential-types = "1"
+aws-sdk-s3 = "1"
+aws-sdk-sts = "1"
+chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
+indicatif = "0.17"
+open = "5"
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
