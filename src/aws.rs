@@ -19,6 +19,7 @@ impl S3Uploader {
             .assume_role()
             .role_arn(role_arn)
             .role_session_name("google-photos-backup")
+            .duration_seconds(12 * 3600) // 12 hours — enough for large Takeout archives
             .send()
             .await
             .context("Failed to assume upload role")?;

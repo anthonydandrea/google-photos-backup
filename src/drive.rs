@@ -2,7 +2,7 @@ use anyhow::Result;
 use indicatif::ProgressBar;
 use reqwest::Client;
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 
@@ -27,6 +27,10 @@ pub struct DriveFile {
     /// File size in bytes as a string, as returned by the Drive API.
     /// Absent for Google Workspace native files.
     pub size: Option<String>,
+    /// Set only in test mode — points to a pre-existing local file so the
+    /// download step can be skipped entirely.
+    #[serde(skip)]
+    pub local_path: Option<PathBuf>,
 }
 
 pub fn is_workspace_file(f: &DriveFile) -> bool {

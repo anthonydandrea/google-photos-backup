@@ -46,6 +46,7 @@ export class InfraStack extends cdk.Stack {
     this.uploadRole = new iam.Role(this, 'PhotoUploadRole', {
       assumedBy: new iam.ArnPrincipal(this.backupUser.userArn),
       description: 'Allows uploading objects to the photo backup bucket',
+      maxSessionDuration: cdk.Duration.hours(12),
     });
 
     this.uploadRole.addToPolicy(

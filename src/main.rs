@@ -4,6 +4,7 @@ mod drive;
 
 use anyhow::Result;
 use chrono::Utc;
+use drive::DriveFile;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::Client;
 use std::time::Duration;
@@ -13,6 +14,8 @@ const DRIVE_FOLDER_NAME: &str = "Takeout";
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
+
+    let test_mode = std::env::args().any(|a| a == "--test");
 
     let creds_file = std::env::var("GOOGLE_CREDENTIALS_FILE")
         .unwrap_or_else(|_| "credentials.json".to_string());
@@ -27,32 +30,62 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(1800))
         .build()?;
 
-    println!("Authenticating with Google Drive ...");
-    let token = auth::load_or_authenticate(&http, &creds_file, &token_file).await?;
-
-    let drive = drive::DriveClient::new(&http, token.access_token);
-
-    println!("Looking up folder \"{DRIVE_FOLDER_NAME}\" ...");
-    let folder_id = drive.find_folder(DRIVE_FOLDER_NAME).await?;
-
-    println!("Listing files ...");
-    let all_files = drive.list_files(&folder_id).await?;
-
-    let (workspace, files): (Vec<_>, Vec<_>) =
-        all_files.into_iter().partition(drive::is_workspace_file);
-
-    if !workspace.is_empty() {
-        println!(
-            "Skipping {} Google Workspace file(s) (not downloadable as binary):",
-            workspace.len()
-        );
-        for f in &workspace {
-            println!("  - {} ({})", f.name, f.mime_type);
-        }
-        println!();
-    }
-
     let date_prefix = Utc::now().format("%Y-%m-%d").to_string();
+
+    // In test mode skip Google Drive entirely and generate a small local file.
+    // In normal mode authenticate, find the folder, and list files from Drive.
+    let tmp_dir = tempfile::tempdir()?;
+    let (files, drive_client) = if test_mode {
+        println!("Test mode: skipping Google Drive, using local test file.");
+
+        let path = tmp_dir.path().join("test-upload.txt");
+        tokio::fs::write(
+            &path,
+            format!(
+                "google-photos-backup test file\nTimestamp: {}\n",
+                Utc::now().to_rfc3339()
+            ),
+        )
+        .await?;
+        let size = tokio::fs::metadata(&path).await?.len();
+
+        let fake_file = DriveFile {
+            id: "test-id".to_string(),
+            name: "test-upload.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            size: Some(size.to_string()),
+            local_path: Some(path),
+        };
+
+        (vec![fake_file], None)
+    } else {
+        println!("Authenticating with Google Drive ...");
+        let token = auth::load_or_authenticate(&http, &creds_file, &token_file).await?;
+        let drive = drive::DriveClient::new(&http, token.access_token);
+
+        println!("Looking up folder \"{DRIVE_FOLDER_NAME}\" ...");
+        let folder_id = drive.find_folder(DRIVE_FOLDER_NAME).await?;
+
+        println!("Listing files ...");
+        let all_files = drive.list_files(&folder_id).await?;
+
+        let (workspace, files): (Vec<_>, Vec<_>) =
+            all_files.into_iter().partition(drive::is_workspace_file);
+
+        if !workspace.is_empty() {
+            println!(
+                "Skipping {} Google Workspace file(s) (not downloadable as binary):",
+                workspace.len()
+            );
+            for f in &workspace {
+                println!("  - {} ({})", f.name, f.mime_type);
+            }
+            println!();
+        }
+
+        (files, Some(drive))
+    };
+
     println!(
         "Found {} file(s) to back up under s3://{bucket}/{date_prefix}/\n",
         files.len()
@@ -61,7 +94,6 @@ async fn main() -> Result<()> {
     println!("Assuming upload role ...");
     let s3 = aws::S3Uploader::new(bucket.clone(), &role_arn).await?;
 
-    let tmp_dir = tempfile::tempdir()?;
     let total = files.len();
     let (mut uploaded, mut failed, mut not_deleted) = (0usize, 0usize, 0usize);
 
@@ -69,10 +101,8 @@ async fn main() -> Result<()> {
 
     let overall = mp.add(ProgressBar::new(total as u64));
     overall.set_style(
-        ProgressStyle::with_template(
-            "[{pos}/{len}] {bar:40.green/white} {msg}",
-        )?
-        .progress_chars("█▉▊▋▌▍▎▏ "),
+        ProgressStyle::with_template("[{pos}/{len}] {bar:40.green/white} {msg}")?
+            .progress_chars("█▉▊▋▌▍▎▏ "),
     );
     overall.set_message("starting ...");
 
@@ -95,21 +125,32 @@ async fn main() -> Result<()> {
             .map(|c| if matches!(c, '/' | '\\' | '\0') { '_' } else { c })
             .collect();
 
-        let tmp_path = tmp_dir.path().join(&safe_name);
         let s3_key = format!("{date_prefix}/{safe_name}");
 
-        // Download with a byte-level progress bar.
-        let dl_bar = mp.insert_after(&overall, ProgressBar::new(0));
-        dl_bar.set_style(dl_style.clone());
-        match drive.download(file, &tmp_path, &dl_bar).await {
-            Err(e) => {
-                dl_bar.finish_and_clear();
-                overall.println(format!("[{}/{}] ✗ {} — download error: {e}", i + 1, total, file.name));
-                failed += 1;
-                continue;
+        // In test mode the file is already local; in normal mode download from Drive.
+        let tmp_path = if let Some(ref local) = file.local_path {
+            local.clone()
+        } else {
+            let path = tmp_dir.path().join(&safe_name);
+            let dl_bar = mp.insert_after(&overall, ProgressBar::new(0));
+            dl_bar.set_style(dl_style.clone());
+
+            match drive_client.as_ref().unwrap().download(file, &path, &dl_bar).await {
+                Err(e) => {
+                    dl_bar.finish_and_clear();
+                    overall.println(format!(
+                        "[{}/{}] ✗ {} — download error: {e:#}",
+                        i + 1,
+                        total,
+                        file.name
+                    ));
+                    failed += 1;
+                    continue;
+                }
+                Ok(()) => dl_bar.finish_and_clear(),
             }
-            Ok(()) => dl_bar.finish_and_clear(),
-        }
+            path
+        };
 
         // Upload with a spinner (S3 SDK doesn't expose byte-level progress).
         let spinner = mp.insert_after(&overall, ProgressBar::new_spinner());
@@ -119,29 +160,45 @@ async fn main() -> Result<()> {
         match s3.upload(&s3_key, &tmp_path).await {
             Err(e) => {
                 spinner.finish_and_clear();
-                overall.println(format!("[{}/{}] ✗ {} — upload error: {e}", i + 1, total, file.name));
+                overall.println(format!(
+                    "[{}/{}] ✗ {} — upload error: {e:#}",
+                    i + 1,
+                    total,
+                    file.name
+                ));
                 failed += 1;
-                let _ = tokio::fs::remove_file(&tmp_path).await;
+                if file.local_path.is_none() {
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                }
                 continue;
             }
             Ok(()) => spinner.finish_and_clear(),
         }
 
         // Only delete from Drive after a confirmed successful S3 upload.
-        match drive.delete(&file.id).await {
-            Ok(()) => {
-                overall.println(format!("[{}/{}] ✓ {}", i + 1, total, file.name));
+        // In test mode there is no Drive file to delete.
+        if let Some(drive) = &drive_client {
+            match drive.delete(&file.id).await {
+                Ok(()) => {
+                    overall.println(format!("[{}/{}] ✓ {}", i + 1, total, file.name));
+                }
+                Err(e) => {
+                    overall.println(format!(
+                        "[{}/{}] ✓ {} (uploaded) — warning: Drive delete failed: {e}",
+                        i + 1,
+                        total,
+                        file.name
+                    ));
+                    not_deleted += 1;
+                }
             }
-            Err(e) => {
-                overall.println(format!(
-                    "[{}/{}] ✓ {} (uploaded) — warning: Drive delete failed: {e}",
-                    i + 1, total, file.name
-                ));
-                not_deleted += 1;
-            }
+        } else {
+            overall.println(format!("[{}/{}] ✓ {}", i + 1, total, file.name));
         }
 
-        let _ = tokio::fs::remove_file(&tmp_path).await;
+        if file.local_path.is_none() {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+        }
         uploaded += 1;
         overall.inc(1);
     }
