@@ -47,6 +47,10 @@ impl<'a> DriveClient<'a> {
         Self { http, access_token }
     }
 
+    pub fn set_token(&mut self, access_token: String) {
+        self.access_token = access_token;
+    }
+
     pub async fn find_folder(&self, name: &str) -> Result<String> {
         #[derive(Deserialize)]
         struct FolderEntry {

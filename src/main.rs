@@ -10,6 +10,35 @@ use reqwest::Client;
 use std::time::Duration;
 
 const DRIVE_FOLDER_NAME: &str = "Takeout";
+const MAX_RETRIES: u32 = 3;
+
+async fn retry<F, Fut, T>(op: F) -> Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut delay = Duration::from_secs(5);
+    for attempt in 1..=MAX_RETRIES {
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if attempt == MAX_RETRIES {
+                    let msg = e.to_string();
+                    if msg.contains("RequestTimeTooSkewed") {
+                        return Err(e.context(
+                            "AWS clock skew — sync your system clock with: sudo sntp -sS time.apple.com",
+                        ));
+                    }
+                    return Err(e);
+                }
+                eprintln!("  attempt {attempt}/{MAX_RETRIES} failed: {e:#} — retrying in {}s ...", delay.as_secs());
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+        }
+    }
+    unreachable!()
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -35,7 +64,7 @@ async fn main() -> Result<()> {
     // In test mode skip Google Drive entirely and generate a small local file.
     // In normal mode authenticate, find the folder, and list files from Drive.
     let tmp_dir = tempfile::tempdir()?;
-    let (files, drive_client) = if test_mode {
+    let (files, mut drive_client, mut google_token) = if test_mode {
         println!("Test mode: skipping Google Drive, using local test file.");
 
         let path = tmp_dir.path().join("test-upload.txt");
@@ -57,11 +86,11 @@ async fn main() -> Result<()> {
             local_path: Some(path),
         };
 
-        (vec![fake_file], None)
+        (vec![fake_file], None, None)
     } else {
         println!("Authenticating with Google Drive ...");
         let token = auth::load_or_authenticate(&http, &creds_file, &token_file).await?;
-        let drive = drive::DriveClient::new(&http, token.access_token);
+        let drive = drive::DriveClient::new(&http, token.access_token.clone());
 
         println!("Looking up folder \"{DRIVE_FOLDER_NAME}\" ...");
         let folder_id = drive.find_folder(DRIVE_FOLDER_NAME).await?;
@@ -83,7 +112,7 @@ async fn main() -> Result<()> {
             println!();
         }
 
-        (files, Some(drive))
+        (files, Some(drive), Some(token))
     };
 
     println!(
@@ -117,6 +146,21 @@ async fn main() -> Result<()> {
     for (i, file) in files.iter().enumerate() {
         overall.set_message(file.name.clone());
 
+        // Refresh the Google token before each file in case it expired mid-run.
+        if let Some(token) = google_token.take() {
+            match auth::ensure_fresh(&http, &creds_file, &token_file, token).await {
+                Ok(fresh) => {
+                    if let Some(ref mut drive) = drive_client {
+                        drive.set_token(fresh.access_token.clone());
+                    }
+                    google_token = Some(fresh);
+                }
+                Err(e) => {
+                    overall.println(format!("Warning: token refresh failed: {e:#}"));
+                }
+            }
+        }
+
         // Sanitize the filename to prevent path traversal when writing to the
         // temp directory. Replace any path separator or null byte with '_'.
         let safe_name: String = file
@@ -135,7 +179,11 @@ async fn main() -> Result<()> {
             let dl_bar = mp.insert_after(&overall, ProgressBar::new(0));
             dl_bar.set_style(dl_style.clone());
 
-            match drive_client.as_ref().unwrap().download(file, &path, &dl_bar).await {
+            let dl_result = retry(|| async {
+                dl_bar.reset();
+                drive_client.as_ref().unwrap().download(file, &path, &dl_bar).await
+            }).await;
+            match dl_result {
                 Err(e) => {
                     dl_bar.finish_and_clear();
                     overall.println(format!(
@@ -157,7 +205,7 @@ async fn main() -> Result<()> {
         spinner.set_style(spinner_style.clone());
         spinner.set_message(format!("Uploading to s3://{bucket}/{s3_key}"));
         spinner.enable_steady_tick(Duration::from_millis(80));
-        match s3.upload(&s3_key, &tmp_path).await {
+        match retry(|| s3.upload(&s3_key, &tmp_path)).await {
             Err(e) => {
                 spinner.finish_and_clear();
                 overall.println(format!(
@@ -177,6 +225,19 @@ async fn main() -> Result<()> {
 
         // Only delete from Drive after a confirmed successful S3 upload.
         // In test mode there is no Drive file to delete.
+        if let Some(token) = google_token.take() {
+            match auth::ensure_fresh(&http, &creds_file, &token_file, token).await {
+                Ok(fresh) => {
+                    if let Some(ref mut drive) = drive_client {
+                        drive.set_token(fresh.access_token.clone());
+                    }
+                    google_token = Some(fresh);
+                }
+                Err(e) => {
+                    overall.println(format!("Warning: token refresh failed before delete: {e:#}"));
+                }
+            }
+        }
         if let Some(drive) = &drive_client {
             match drive.delete(&file.id).await {
                 Ok(()) => {

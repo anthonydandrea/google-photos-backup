@@ -30,7 +30,7 @@ pub struct Token {
 }
 
 impl Token {
-    fn is_expired(&self) -> bool {
+    pub fn is_expired(&self) -> bool {
         Utc::now() >= self.expiry - Duration::seconds(60)
     }
 }
@@ -61,6 +61,17 @@ pub async fn load_or_authenticate(
     let token = browser_flow(http, &creds).await?;
     save_token(token_path, &token).await?;
     Ok(token)
+}
+
+/// Refresh the token if it is close to expiry. Returns the (possibly new) token.
+pub async fn ensure_fresh(http: &Client, creds_path: &str, token_path: &str, token: Token) -> Result<Token> {
+    if !token.is_expired() {
+        return Ok(token);
+    }
+    let creds = load_creds(creds_path).await?;
+    let refreshed = do_refresh(http, &creds, &token).await?;
+    save_token(token_path, &refreshed).await?;
+    Ok(refreshed)
 }
 
 async fn load_creds(path: &str) -> Result<InstalledCreds> {
