@@ -45,6 +45,7 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
     let test_mode = std::env::args().any(|a| a == "--test");
+    let prune_only = std::env::args().any(|a| a == "--prune-only");
 
     let creds_file = std::env::var("GOOGLE_CREDENTIALS_FILE")
         .unwrap_or_else(|_| "credentials.json".to_string());
@@ -60,6 +61,34 @@ async fn main() -> Result<()> {
         .build()?;
 
     let date_prefix = Utc::now().format("%Y-%m-%d").to_string();
+
+    println!("Assuming upload role ...");
+    let s3 = aws::S3Uploader::new(bucket.clone(), &role_arn).await?;
+
+    // Prune old backups — keep only the 3 most recent date prefixes.
+    println!("Checking for old backups to prune ...");
+    match s3.list_backup_prefixes().await {
+        Err(e) => eprintln!("Warning: could not list backup prefixes: {e:#}"),
+        Ok(prefixes) => {
+            let keep = 3usize;
+            if prefixes.len() > keep {
+                let to_delete = &prefixes[..prefixes.len() - keep];
+                for prefix in to_delete {
+                    print!("  Deleting old backup {prefix} ... ");
+                    match s3.delete_prefix(prefix).await {
+                        Ok(n) => println!("{n} object(s) deleted."),
+                        Err(e) => eprintln!("warning: {e:#}"),
+                    }
+                }
+            } else {
+                println!("  {} backup(s) present — nothing to prune.", prefixes.len());
+            }
+        }
+    }
+
+    if prune_only {
+        return Ok(());
+    }
 
     // In test mode skip Google Drive entirely and generate a small local file.
     // In normal mode authenticate, find the folder, and list files from Drive.
@@ -119,9 +148,6 @@ async fn main() -> Result<()> {
         "Found {} file(s) to back up under s3://{bucket}/{date_prefix}/\n",
         files.len()
     );
-
-    println!("Assuming upload role ...");
-    let s3 = aws::S3Uploader::new(bucket.clone(), &role_arn).await?;
 
     let total = files.len();
     let (mut uploaded, mut failed, mut not_deleted) = (0usize, 0usize, 0usize);

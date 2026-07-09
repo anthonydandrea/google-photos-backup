@@ -52,8 +52,16 @@ export class InfraStack extends cdk.Stack {
     this.uploadRole.addToPolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
-        actions: ['s3:PutObject'],
+        actions: ['s3:PutObject', 's3:DeleteObject'],
         resources: [`${this.bucket.bucketArn}/*`],
+      }),
+    );
+
+    this.uploadRole.addToPolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: ['s3:ListBucket'],
+        resources: [this.bucket.bucketArn],
       }),
     );
 

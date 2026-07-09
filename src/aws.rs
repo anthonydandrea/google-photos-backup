@@ -58,6 +58,72 @@ impl S3Uploader {
         })
     }
 
+    /// Returns top-level date prefixes (e.g. ["2024-01-01/", "2024-02-01/"]) sorted ascending.
+    pub async fn list_backup_prefixes(&self) -> Result<Vec<String>> {
+        let resp = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .delimiter("/")
+            .send()
+            .await
+            .context("S3 ListObjectsV2 failed")?;
+
+        let mut prefixes: Vec<String> = resp
+            .common_prefixes()
+            .iter()
+            .filter_map(|p| p.prefix().map(|s| s.to_string()))
+            .collect();
+
+        prefixes.sort();
+        Ok(prefixes)
+    }
+
+    /// Deletes all objects under `prefix` (e.g. "2024-01-01/").
+    pub async fn delete_prefix(&self, prefix: &str) -> Result<usize> {
+        let mut deleted_count = 0;
+        let mut continuation_token: Option<String> = None;
+
+        loop {
+            let mut req = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(prefix);
+
+            if let Some(ref token) = continuation_token {
+                req = req.continuation_token(token);
+            }
+
+            let page = req.send().await.context("S3 ListObjectsV2 failed")?;
+
+            let keys: Vec<String> = page
+                .contents()
+                .iter()
+                .filter_map(|o| o.key().map(|k| k.to_string()))
+                .collect();
+
+            for key in &keys {
+                self.client
+                    .delete_object()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .send()
+                    .await
+                    .with_context(|| format!("S3 DeleteObject failed for key: {key}"))?;
+                deleted_count += 1;
+            }
+
+            if page.is_truncated().unwrap_or(false) {
+                continuation_token = page.next_continuation_token().map(|s| s.to_string());
+            } else {
+                break;
+            }
+        }
+
+        Ok(deleted_count)
+    }
+
     pub async fn upload(&self, key: &str, path: &Path) -> Result<()> {
         let file_size = tokio::fs::metadata(path)
             .await
